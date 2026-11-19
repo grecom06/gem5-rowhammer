@@ -33,3 +33,5 @@ configs/dram/lowp_sweep.cfg
 .pyenv
 .vscode
 typings
+/util/hammersim/prob-005.json
+/ext/json/json/

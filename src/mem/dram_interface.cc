@@ -3983,8 +3983,27 @@ DRAMInterface::DRAMStats::DRAMStats(DRAMInterface &_dram)
              "Data bus utilization in percentage for writes"),
 
     ADD_STAT(pageHitRate, statistics::units::Ratio::get(),
-             "Row buffer hit rate, read and write combined")
+             "Row buffer hit rate, read and write combined"),
 
+    // hammersim: register the RowHammer counters so they appear in stats.txt
+    ADD_STAT(rowHammerTotalBitflips, statistics::units::Count::get(),
+             "Total RowHammer bitflips"),
+    ADD_STAT(rowHammerSingleSidedBitflips, statistics::units::Count::get(),
+             "Single-sided RowHammer bitflips"),
+    ADD_STAT(rowHammerDoubleSidedBitflips, statistics::units::Count::get(),
+             "Double-sided RowHammer bitflips"),
+    ADD_STAT(rowHammerHalfDoubleBitflips, statistics::units::Count::get(),
+             "Half-double RowHammer bitflips"),
+    ADD_STAT(rowHammerCorruptedBitCount, statistics::units::Count::get(),
+             "Bits corrupted in memory by RowHammer"),
+    ADD_STAT(rowHammerEccCorrected, statistics::units::Count::get(),
+             "RowHammer errors corrected by ECC"),
+    ADD_STAT(rowHammerEccDetected, statistics::units::Count::get(),
+             "RowHammer errors detected (not corrected) by ECC"),
+    ADD_STAT(rowHammerSamplerTriggers, statistics::units::Count::get(),
+             "Rows inserted into the TRR sampler tables"),
+    ADD_STAT(rowHammerInhibitorTriggers, statistics::units::Count::get(),
+             "TRR inhibitor (targeted refresh) triggers")
 {
 }
 
