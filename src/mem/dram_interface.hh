@@ -49,6 +49,11 @@
 #include <random>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "mem/drampower.hh"
 #include "mem/mem_interface.hh"
@@ -601,6 +606,42 @@ class DRAMInterface : public MemInterface
     bool first_act = false;
     uint64_t para_refreshes;
 
+    // ---- Memory Band-Aid prototype ----------------------------------------
+    // Token-bucket rate limits for untrusted requestors, enforced at
+    // scheduling time through burstReady(). See DRAMInterface.py (rl_*).
+    const bool rlEnable;
+    const bool rlPerBank;      // false: one bucket per requestor (global)
+    const bool rlCountActs;    // false: charge every access
+    const bool rlDomainScope;  // true: throttled requestors share buckets
+    const uint64_t rlBudget;
+    const uint64_t rlBurst;
+    const Tick rlWindow;
+    const std::vector<std::string> rlThrottledNames;
+    const bool trackRowActs;
+    double rlRate;             // tokens per tick
+
+    struct RlBucket
+    {
+        double tokens;
+        Tick last;
+    };
+    std::unordered_set<RequestorID> rlThrottled;
+    std::unordered_map<uint64_t, RlBucket> rlBuckets;
+    EventFunctionWrapper rlWakeEvent;
+
+    // Sliding-window activation history per (rank, bank, row)
+    std::unordered_map<uint64_t, std::deque<Tick>> rowActTimes;
+    uint64_t maxRowActs = 0;
+
+    uint64_t rlKey(const MemPacket* pkt) const;
+    RlBucket& rlBucket(uint64_t key);
+    bool rlAllows(const MemPacket* pkt);
+    void rlCharge(const MemPacket* pkt);
+    void rlScheduleWake(Tick when);
+    void rlWake();
+    void trackRowActivation(uint8_t rank, uint8_t bank, uint32_t row);
+    // -----------------------------------------------------------------------
+
     enums::PageManage pageMgmt;
     /**
      * Max column accesses (read and write) per row, before forefully
@@ -738,6 +779,12 @@ class DRAMInterface : public MemInterface
         // is counted as a samplertrigger
         statistics::Scalar rowHammerSamplerTriggers;
         statistics::Scalar rowHammerInhibitorTriggers;
+
+        // Memory Band-Aid prototype
+        statistics::Scalar rlDenials;
+        statistics::Scalar rlChargedOps;
+        statistics::Scalar rlWakeups;
+        statistics::Scalar maxRowActsInWindow;
         
     };
 
@@ -871,7 +918,12 @@ class DRAMInterface : public MemInterface
     bool
     burstReady(MemPacket* pkt) const override
     {
-        return ranks[pkt->rank]->inRefIdleState();
+        // Memory Band-Aid: a throttled requestor without budget for this
+        // bank is not schedulable. rlAllows() updates bucket state and may
+        // schedule a wake-up, hence the const_cast.
+        return ranks[pkt->rank]->inRefIdleState() &&
+               (!rlEnable ||
+                const_cast<DRAMInterface*>(this)->rlAllows(pkt));
     }
 
     /**

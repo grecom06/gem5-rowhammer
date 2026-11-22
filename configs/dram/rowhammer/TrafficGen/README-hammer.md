@@ -39,6 +39,11 @@ build/X86/gem5.opt configs/dram/rowhammer/TrafficGen/hammer.py \
 
 A 100 ms run takes a few seconds.
 
+**With default settings, these attacks produce no flips.** The default
+request rate stays below the default 50K threshold. To see flips, add
+`--period-min 1000000 --period-max 1300000` or lower `--rh-threshold`
+(see Known issues).
+
 ## Choosing the aggressor rows
 
 Either give victim rows and a pattern, or list the aggressor rows yourself.
@@ -75,6 +80,51 @@ default unless you set them.
 | `--page-policy`, `--sched-policy` | class default | Memory-controller policies |
 | `--dram-param NAME=VALUE` | | Set any other DRAM parameter; can be repeated |
 | `--no-synthetic` | | Don't set `synthetic_traffic=True`, which reduces flips to make up for how fast generators hammer |
+
+## Memory Band-Aid (rate limiting)
+
+A prototype of Memory Band-Aid (Fiedler et al., NDSS 2026), implemented in
+`DRAMInterface` (`rl_*` parameters in `src/mem/DRAMInterface.py`). Throttled
+requestors get a token bucket. A packet is only schedulable when its
+bucket has a token. Buckets refill at `(budget - burst) / window`, so no
+interval of length `--rl-window` contains more than `--rl-budget` charged
+operations.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--rl-budget N` | off | Enables the limiter: at most N charged operations per bucket per window |
+| `--rl-burst` | 16 | Bucket capacity (burst allowance); must be < budget |
+| `--rl-window` | `64ms` | Window; also used for `maxRowActsInWindow` |
+| `--rl-mode` | `per_bank` | `per_bank`: one bucket per requestor per bank. `global`: one per requestor (the bandwidth-limit approximation from the paper's proof of concept) |
+| `--rl-count` | `acts` | `acts`: charge activations only (row hits are free). `accesses`: charge every burst |
+| `--rl-scope` | `requestor` | `requestor`: a bucket per throttled requestor. `domain`: all throttled requestors share buckets |
+| `--rl-throttle` | `aggressor` | Requestor-name substrings to throttle |
+
+Always run the same attack without the limiter first, to check that it
+flips bits on its own. Otherwise "0 flips" with the limiter proves
+nothing. The faster `--period-*` values are needed: the default rate
+stays below the default 50K threshold (see Known issues).
+
+```bash
+ATTACK="--victims 50 --pattern double --period-min 1000000 --period-max 1300000 \
+    --device-map util/hammersim/row_experiment_vendor_b/dimm0.bank-4.json"
+
+# 1. Baseline, no mitigation: maxRowActsInWindow ~53.7K, about 30 flips
+build/X86/gem5.opt -d m5out/mba-off configs/dram/rowhammer/TrafficGen/hammer.py $ATTACK
+
+# 2. Same attack, per-bank limit of 20K activations per 64 ms:
+#    maxRowActsInWindow 19,999, 0 flips
+build/X86/gem5.opt -d m5out/mba-on configs/dram/rowhammer/TrafficGen/hammer.py $ATTACK \
+    --rl-budget 20000
+```
+
+Stats (in `summary.json` under `rowhammer_stats`):
+- `maxRowActsInWindow`: the most activations any row got in any window
+  (sliding). **This is the security metric.** It counts all traffic,
+  including unthrottled requestors.
+- `rlChargedOps`, `rlDenials` (scheduler checks refused), `rlWakeups`.
+- `generator_stats` in `summary.json` gives each generator's average read
+  latency, for measuring the cost to unthrottled traffic.
 
 ## Output
 
@@ -133,10 +183,14 @@ to 6 aggressors, and flips start at 8.
 - **Flip counts vary between identical runs.** The model picks which weak
   cell flips using a seed from the wall-clock time. Repeat every
   configuration (3 or more times) and report the spread.
-- **The request rate only just crosses the threshold.** The default period
-  gives each aggressor about 45K activations per 64 ms, so small changes
-  matter. For example, 2-sided attacks get about 3% row-buffer hits and fall
-  below a 45K threshold. Lower `--period-min/max` for a clear margin.
+- **The default request rate is at or below the threshold.** The default
+  period (taken from the vendor scripts) gives each aggressor about 45K
+  activations per 64 ms. That is below the default `rowhammer_threshold`
+  of 50K, so **attacks with default settings produce no flips at all**.
+  It only just crosses 45K, and 2-sided attacks get about 3% row-buffer
+  hits, which leaves about 43.7K. Use `--period-min 1000000
+  --period-max 1300000` (about 54K) or lower `--rh-threshold`. Check
+  `maxRowActsInWindow` against the threshold to see which side you're on.
 - **`double_sided_prob` has no effect.** Once a double-sided attack is
   detected, a weak cell always flips (`checkRowHammer()` in
   `dram_interface.cc`).

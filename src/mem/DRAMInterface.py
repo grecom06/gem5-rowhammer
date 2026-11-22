@@ -174,6 +174,45 @@ class DRAMInterface(MemInterface):
     ecc_algorithm = Param.Int(
         0, "Specify an ECC algorithm index to use in online hammersim"
     )
+
+    # Memory Band-Aid prototype (Fiedler et al., NDSS 2026): rate-limit the
+    # DRAM activations (or accesses) of untrusted requestors so that no row
+    # can reach the RowHammer threshold. Implemented as token buckets that
+    # refill at (rl_budget - rl_burst) / rl_window, which bounds the number of
+    # charged operations in ANY interval of length rl_window by rl_budget.
+    rl_enable = Param.Bool(False, "Enable Memory Band-Aid rate limiting")
+    rl_mode = Param.String(
+        "per_bank",
+        "per_bank: one budget per (requestor, rank, bank); "
+        "global: one budget per requestor across all banks",
+    )
+    rl_count = Param.String(
+        "acts",
+        "acts: charge only row activations (row hits are free); "
+        "accesses: charge every DRAM burst",
+    )
+    rl_scope = Param.String(
+        "requestor",
+        "requestor: each throttled requestor has its own budget; "
+        "domain: all throttled requestors share one budget",
+    )
+    rl_budget = Param.Unsigned(
+        1000, "Max charged operations per bucket in any rl_window interval"
+    )
+    rl_burst = Param.Unsigned(
+        16, "Bucket capacity (allowed burst); must be smaller than rl_budget"
+    )
+    rl_window = Param.Latency("64ms", "Rate-limit window (normally tREFW)")
+    rl_throttled = VectorParam.String(
+        [],
+        "Requestors to throttle: any requestor whose name contains one of "
+        "these substrings (e.g. 'aggressor', 'cpu1')",
+    )
+    track_row_acts = Param.Bool(
+        False,
+        "Track the maximum number of activations any row receives within "
+        "rl_window (sliding window), reported as maxRowActsInWindow",
+    )
     # scheduler page policy
     page_policy = Param.PageManage("open_adaptive", "Page management policy")
 

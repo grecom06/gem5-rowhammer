@@ -39,6 +39,8 @@
  */
 #include "mem/dram_interface.hh"
 
+#include <cmath>
+
 #include "base/bitfield.hh"
 #include "base/cprintf.hh"
 #include "base/trace.hh"
@@ -1742,6 +1744,10 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick next_burst_at,
 
     assert(rank_ref.inRefIdleState());
 
+    // Memory Band-Aid in access-counting mode charges every burst.
+    if (!rlCountActs)
+        rlCharge(mem_pkt);
+
     // are we in or transitioning to a low-power state and have not scheduled
     // a power-up event?
     // if so, wake up from power down to issue RD/WR burst
@@ -1796,6 +1802,13 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick next_burst_at,
         DPRINTF(DRAMAddr, "ACT: Addr %#x, rank %d bank %d row %d\n",
                     mem_pkt->addr, rank_ref.rank, bank_ref.bank, mem_pkt->row);
         activateBank(rank_ref, bank_ref, act_tick, mem_pkt->row);
+
+        // Memory Band-Aid: charge the activation, and record it for the
+        // per-row sliding-window maximum.
+        if (rlCountActs)
+            rlCharge(mem_pkt);
+        if (trackRowActs)
+            trackRowActivation(rank_ref.rank, bank_ref.bank, mem_pkt->row);
 
         // Okay, even though ECC is functionally implemented, ECC only corrects
         // when the DRAM does a READ.
@@ -2231,6 +2244,17 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
       pMatrixFileName(_p.p_matrix),
       eccAlgorithm(_p.ecc_algorithm),
       generator(seedEngine_()),
+      rlEnable(_p.rl_enable),
+      rlPerBank(_p.rl_mode == "per_bank"),
+      rlCountActs(_p.rl_count == "acts"),
+      rlDomainScope(_p.rl_scope == "domain"),
+      rlBudget(_p.rl_budget),
+      rlBurst(_p.rl_burst),
+      rlWindow(_p.rl_window),
+      rlThrottledNames(_p.rl_throttled),
+      trackRowActs(_p.track_row_acts),
+      rlRate(0.0),
+      rlWakeEvent([this]{ rlWake(); }, name() + ".rlWakeEvent"),
       pageMgmt(_p.page_policy),
       maxAccessesPerRow(_p.max_accesses_per_row),
       timeStampOffset(0), activeRank(0),
@@ -2239,6 +2263,26 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
       stats(*this)
 {
     DPRINTF(DRAM, "Setting up DRAM Interface\n");
+
+    // Memory Band-Aid parameter checks
+    fatal_if(_p.rl_mode != "per_bank" && _p.rl_mode != "global",
+             "rl_mode must be 'per_bank' or 'global', got '%s'\n",
+             _p.rl_mode);
+    fatal_if(_p.rl_count != "acts" && _p.rl_count != "accesses",
+             "rl_count must be 'acts' or 'accesses', got '%s'\n",
+             _p.rl_count);
+    fatal_if(_p.rl_scope != "requestor" && _p.rl_scope != "domain",
+             "rl_scope must be 'requestor' or 'domain', got '%s'\n",
+             _p.rl_scope);
+    if (rlEnable) {
+        fatal_if(rlBurst < 1 || rlBurst >= rlBudget,
+                 "rl_burst (%d) must be >= 1 and smaller than rl_budget "
+                 "(%d)\n", rlBurst, rlBudget);
+        fatal_if(rlWindow == 0, "rl_window must be non-zero\n");
+        // burst + rate * window == budget: no interval of length rl_window
+        // can contain more than rl_budget charged operations.
+        rlRate = double(rlBudget - rlBurst) / double(rlWindow);
+    }
 
     fatal_if(!isPowerOf2(burstSize), "DRAM burst size %d is not allowed, "
              "must be a power of two\n", burstSize);
@@ -2448,7 +2492,134 @@ DRAMInterface::startup()
             r->startup(curTick() + tREFI - tRP);
         }
     }
+
+    // Memory Band-Aid: resolve throttled requestor names to IDs. All
+    // requestors have registered with the System by now.
+    if (rlEnable) {
+        for (RequestorID id = 0; id < system()->maxRequestors(); id++) {
+            const std::string req_name = system()->getRequestorName(id);
+            for (const auto &pattern : rlThrottledNames) {
+                if (!pattern.empty() &&
+                        req_name.find(pattern) != std::string::npos) {
+                    rlThrottled.insert(id);
+                    inform("Memory Band-Aid: throttling requestor %d (%s)\n",
+                           id, req_name);
+                    break;
+                }
+            }
+        }
+        warn_if(rlThrottled.empty(), "Memory Band-Aid is enabled but no "
+                "requestor matches rl_throttled\n");
+        inform("Memory Band-Aid: mode %s, count %s, scope %s, budget %d per "
+               "%d ticks, burst %d\n", rlPerBank ? "per_bank" : "global",
+               rlCountActs ? "acts" : "accesses",
+               rlDomainScope ? "domain" : "requestor", rlBudget, rlWindow,
+               rlBurst);
+    }
 }
+
+// ---- Memory Band-Aid prototype ----------------------------------------------
+
+uint64_t
+DRAMInterface::rlKey(const MemPacket* pkt) const
+{
+    // [requestor (or shared domain id) | rank | bank]
+    const uint64_t req = rlDomainScope ? 0xFFFF : pkt->requestorId();
+    const uint64_t rank = rlPerBank ? pkt->rank : 0;
+    const uint64_t bank = rlPerBank ? pkt->bank : 0;
+    return (req << 32) | (rank << 16) | bank;
+}
+
+DRAMInterface::RlBucket&
+DRAMInterface::rlBucket(uint64_t key)
+{
+    auto it = rlBuckets.find(key);
+    if (it == rlBuckets.end()) {
+        // a new bucket starts full
+        it = rlBuckets.emplace(key, RlBucket{double(rlBurst),
+                                             curTick()}).first;
+    } else {
+        RlBucket &b = it->second;
+        b.tokens = std::min(double(rlBurst),
+                            b.tokens + rlRate * double(curTick() - b.last));
+        b.last = curTick();
+    }
+    return it->second;
+}
+
+bool
+DRAMInterface::rlAllows(const MemPacket* pkt)
+{
+    if (rlThrottled.find(pkt->requestorId()) == rlThrottled.end())
+        return true;
+
+    // In activation mode a row-buffer hit costs nothing.
+    if (rlCountActs &&
+            ranks[pkt->rank]->banks[pkt->bank].openRow == pkt->row)
+        return true;
+
+    RlBucket &b = rlBucket(rlKey(pkt));
+    if (b.tokens >= 1.0)
+        return true;
+
+    // Out of budget: make sure the scheduler runs again once a token is
+    // available, otherwise a queue holding only throttled packets stalls.
+    const Tick wait = std::max<Tick>(1,
+        Tick(std::ceil((1.0 - b.tokens) / rlRate)));
+    rlScheduleWake(curTick() + wait);
+    stats.rlDenials++;
+    return false;
+}
+
+void
+DRAMInterface::rlCharge(const MemPacket* pkt)
+{
+    if (!rlEnable ||
+            rlThrottled.find(pkt->requestorId()) == rlThrottled.end())
+        return;
+    // May go below zero if the row was closed between selection and issue;
+    // the debt is repaid before the next operation is allowed.
+    rlBucket(rlKey(pkt)).tokens -= 1.0;
+    stats.rlChargedOps++;
+}
+
+void
+DRAMInterface::rlScheduleWake(Tick when)
+{
+    if (rlWakeEvent.scheduled()) {
+        if (rlWakeEvent.when() <= when)
+            return;
+        reschedule(rlWakeEvent, when);
+    } else {
+        schedule(rlWakeEvent, when);
+    }
+}
+
+void
+DRAMInterface::rlWake()
+{
+    stats.rlWakeups++;
+    if (!ctrl->requestEventScheduled(pseudoChannel))
+        ctrl->restartScheduler(curTick(), pseudoChannel);
+}
+
+void
+DRAMInterface::trackRowActivation(uint8_t rank, uint8_t bank, uint32_t row)
+{
+    const uint64_t key = (uint64_t(rank) << 48) | (uint64_t(bank) << 32) |
+                         row;
+    auto &times = rowActTimes[key];
+    times.push_back(curTick());
+    // keep only activations inside the sliding window (now - window, now]
+    while (!times.empty() && times.front() + rlWindow <= curTick())
+        times.pop_front();
+    if (times.size() > maxRowActs) {
+        maxRowActs = times.size();
+        stats.maxRowActsInWindow = maxRowActs;
+    }
+}
+
+// -----------------------------------------------------------------------------
 
 bool
 DRAMInterface::isBusy(bool read_queue_empty, bool all_writes_nvm)
@@ -4003,7 +4174,17 @@ DRAMInterface::DRAMStats::DRAMStats(DRAMInterface &_dram)
     ADD_STAT(rowHammerSamplerTriggers, statistics::units::Count::get(),
              "Rows inserted into the TRR sampler tables"),
     ADD_STAT(rowHammerInhibitorTriggers, statistics::units::Count::get(),
-             "TRR inhibitor (targeted refresh) triggers")
+             "TRR inhibitor (targeted refresh) triggers"),
+
+    ADD_STAT(rlDenials, statistics::units::Count::get(),
+             "Memory Band-Aid: scheduler checks denied for lack of budget"),
+    ADD_STAT(rlChargedOps, statistics::units::Count::get(),
+             "Memory Band-Aid: operations charged to throttled requestors"),
+    ADD_STAT(rlWakeups, statistics::units::Count::get(),
+             "Memory Band-Aid: scheduler wake-ups after budget refill"),
+    ADD_STAT(maxRowActsInWindow, statistics::units::Count::get(),
+             "Max activations of any single row within rl_window "
+             "(sliding; needs track_row_acts)")
 {
 }
 

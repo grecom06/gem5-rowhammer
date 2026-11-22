@@ -140,6 +140,25 @@ def parse_args():
     g.add_argument("--summary", default="summary.json",
                    help="Summary file name, written inside the gem5 outdir")
 
+    g = p.add_argument_group(
+        "Memory Band-Aid (rate limiting; enabled by --rl-budget)")
+    g.add_argument("--rl-budget", type=int, default=None,
+                   help="Max charged operations per bucket in any --rl-window "
+                        "interval. Setting this enables the mitigation")
+    g.add_argument("--rl-burst", type=int, default=16,
+                   help="Bucket capacity (burst allowance), < --rl-budget")
+    g.add_argument("--rl-window", default="64ms")
+    g.add_argument("--rl-mode", default="per_bank",
+                   choices=["per_bank", "global"])
+    g.add_argument("--rl-count", default="acts", choices=["acts", "accesses"])
+    g.add_argument("--rl-scope", default="requestor",
+                   choices=["requestor", "domain"])
+    g.add_argument("--rl-throttle", default="aggressor",
+                   help="Comma-separated requestor-name substrings to "
+                        "throttle (aggressor generators by default)")
+    g.add_argument("--no-track-row-acts", action="store_true",
+                   help="Do not track maxRowActsInWindow (on by default)")
+
     args = p.parse_args()
     if args.aggressors is None and not args.victims:
         p.error("give --victims (with --pattern) or --aggressors")
@@ -252,6 +271,21 @@ def configure_dram(dram, args):
         dram.rh_stat_dump = True
         dram.rh_stat_file = os.path.join(m5.options.outdir,
                                          "rowhammer.trace")
+    # Memory Band-Aid. The rate-limit window also defines the sliding window
+    # for maxRowActsInWindow, so it is set even when the limiter is off.
+    dram.rl_window = args.rl_window
+    dram.track_row_acts = not args.no_track_row_acts
+    if args.rl_budget is not None:
+        if not 1 <= args.rl_burst < args.rl_budget:
+            fail("--rl-burst must be >= 1 and smaller than --rl-budget")
+        dram.rl_enable = True
+        dram.rl_budget = args.rl_budget
+        dram.rl_burst = args.rl_burst
+        dram.rl_mode = args.rl_mode
+        dram.rl_count = args.rl_count
+        dram.rl_scope = args.rl_scope
+        dram.rl_throttled = [s.strip() for s in args.rl_throttle.split(",")
+                             if s.strip()]
     for item in args.dram_param:
         name, sep, value = item.partition("=")
         if not sep:
@@ -259,12 +293,36 @@ def configure_dram(dram, args):
         set_param(dram, name.strip(), value.strip())
 
 
+def collect_generator_stats(stats_path, block_size):
+    """Per-generator packets, bytes and average read latency (ticks)."""
+    gens = {}
+    if not os.path.exists(stats_path):
+        return gens
+    pattern = re.compile(
+        r"^system\.((?:aggressor|victim)\d+)\."
+        r"(numPackets|bytesRead|totalReadLatency)\s+(\S+)")
+    with open(stats_path) as f:
+        for line in f:
+            if line.startswith("---------- Begin"):
+                gens = {}
+            m = pattern.match(line)
+            if m:
+                gens.setdefault(m.group(1), {})[m.group(2)] = float(m.group(3))
+    for g in gens.values():
+        reads = g.get("bytesRead", 0) / block_size
+        g["avgReadLatency"] = (g.get("totalReadLatency", 0) / reads
+                               if reads else None)
+    return gens
+
+
 def collect_rh_stats(stats_path):
-    """All rowHammer* scalars from the last dump in stats.txt."""
+    """All rowHammer*, Memory Band-Aid (rl*) and maxRowActsInWindow scalars
+    from the last dump in stats.txt."""
     result = {}
     if not os.path.exists(stats_path):
         return result
-    pattern = re.compile(r"^(\S*\.rowHammer\w+)\s+(\S+)")
+    pattern = re.compile(
+        r"^(\S*\.(?:rowHammer\w+|rl\w+|maxRowActsInWindow))\s+(\S+)")
     with open(stats_path) as f:
         for line in f:
             if line.startswith("---------- Begin"):
@@ -399,6 +457,8 @@ def main():
     # Write stats now so the summary can include them.
     m5.stats.dump()
     stats = collect_rh_stats(os.path.join(m5.options.outdir, "stats.txt"))
+    gen_stats = collect_generator_stats(
+        os.path.join(m5.options.outdir, "stats.txt"), args.block_size)
 
     summary = {
         "command": sys.argv,
@@ -409,6 +469,7 @@ def main():
         "sim_ticks": m5.curTick(),
         "exit_cause": exit_event.getCause(),
         "rowhammer_stats": stats,
+        "generator_stats": gen_stats,
     }
     out = os.path.join(m5.options.outdir, args.summary)
     with open(out, "w") as f:
