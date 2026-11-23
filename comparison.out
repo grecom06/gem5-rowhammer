@@ -1,0 +1,15 @@
+stat                                       OFF            ON
+rowHammerTotalBitflips                    34.0           0.0
+rowHammerDoubleSidedBitflips              34.0           0.0
+maxRowActsInWindow                     53730.0       19999.0
+rlChargedOps                               0.0       62480.0
+rlDenials                                  0.0      625579.0
+rlWakeups                                  0.0       61360.0
+
+budget_sweep
+budget  repsrow   HammerTotalBitflips maxRowActsInWindow rlDenials  victimLat_ns    aggrLat_ns
+off     3                  30.3           53730.0           0.0           nan          73.9
+5000     3                   0.0            4999.0     2815297.0           nan        5891.9
+10000     3                   0.0            9999.0     1353076.0           nan        2710.0
+20000     3                   0.0           19999.0      625579.0           nan        1169.5
+40000     3                   0.0           39999.0      134142.0           nan         267.9
